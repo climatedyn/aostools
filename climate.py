@@ -11,6 +11,18 @@ from __future__ import print_function
 import numpy as np
 # from numba import jit
 
+## helper function: Get actual width and height of axes
+def GetAxSize(fig,ax,dpi=False):
+	"""get width and height of a given axis.
+	   output is in inches if dpi=False, in dpi if dpi=True
+	"""
+	bbox = ax.get_window_extent().transformed(fig.dpi_scale_trans.inverted())
+	width, height = bbox.width, bbox.height
+	if dpi:
+		width *= fig.dpi
+		height *= fig.dpi
+	return width, height
+
 ## helper function: check if string contained in list (set) of strings
 def CheckAny(string,set):
 	for c in set:
@@ -717,6 +729,7 @@ def ComputeWstar(data, slice='all', omega='omega', temp='temp', vcomp='vcomp', p
 		return w_bar + np.squeeze(R*vt_bar)
 	else:
 		return w_bar + R*vt_bar
+
 ##############################################################################################
 def ComputeEPfluxDiv(lat,pres,u,v,t,w=None,do_ubar=False,wave=-1):
 	""" Compute the EP-flux vectors and divergence terms.
@@ -821,6 +834,212 @@ def ComputeEPfluxDiv(lat,pres,u,v,t,w=None,do_ubar=False,wave=-1):
 	div2 = div2*86400
 	#
 	return ep1_cart,ep2_cart,div1,div2
+
+##############################################################################################
+def ComputeWaveActivityFlux(phi_or_u,phiref_or_v,uref,vref,lat='lat',lon='lon',pres='level',tref=None,qg=False):
+    '''
+        Compute Wave Activity Flux as in Takaya & Nakamura GRL 1997 and Takaya & Nakamura JAS 2001.
+        Results checked against plots at http://www.atmos.rcast.u-tokyo.ac.jp/nishii/programs/
+        This is 3D wave flux in a non-zonally symmetric base flow, optionally QG approximated.
+        Inputs are xarray DataArrays.
+        Latitude, longitude in degrees, pressure in hPa.
+
+        INPUTS:
+        phi_or_u   : geopotential [m2/s2] (qg = True) OR zonal wind [m/s] (qg = False)
+        phiref_or_v: reference geopotential [m2/s2] (qg = True)
+                        OR (full) meridional wind [m/s] (qg = False)
+        uref       : reference zonal wind [m/s]
+        vref       : reference meridional wind [m/s]
+        lat        : name of latitude in DataArrays
+        lon        : name of longitude in DataArrays
+        pres       : name of pressure in DataArrays [hPa]
+        tref       : reference temperature [K] for static stability parameter S2.
+                       If None, only compute horizontal wave flux.
+                       Else, used to compute S2.
+                         If xr.Dataset or xr.DataArray, compute S2 assuming tref is temperature [K].
+                         Else, assume S2 = tref.
+                         Note that S2 should be a function of
+                          pressure only (see Vallis 2017, Eq 5.127)
+        qg         : use QG streamfunction (phi-phiref)/f? Otherwise, use windspharm.streamfunction.
+                       Note that if qg=False, phi_or_u = u and phiref_or_v = v to compute the streamfunction.
+        OUTPUTS:
+        Wx,Wy    : Activity Vectors along lon [m2/s2], lat [m2/s2]
+        Wx,Wy,Wz : Activity Vectors along lon [m2/s2], lat [m2/s2], pres [hPa.m/s2]
+        '''
+    import numpy as np
+    from xarray import DataArray
+    for var in [phi_or_u,uref,vref,phiref_or_v,tref]:
+        if not isinstance(var,DataArray):
+            if var is None or np.isscalar(var):
+                pass
+            else:
+                raise ValueError('all inputs have to be xarray.DataArrays!')
+    a0 = 6376000.0
+    Rd = 287.04
+    kappa = 2./7
+    p0 = 1.e3
+    radlat = np.deg2rad(phi_or_u[lat])
+    coslat = np.cos(radlat)
+    one_over_coslat2 = coslat**(-2)
+    one_over_a2 = a0**(-2)
+    mag_u = np.sqrt(uref**2+vref**2)
+    f  = 2*2*np.pi/86400.*np.sin(radlat)
+
+    if qg:
+        psi = (phi_or_u-phiref_or_v)/f
+    else:
+        from windspharm.xarray import VectorWind
+        psi = VectorWind(phi_or_u-uref,phiref_or_v-vref).streamfunction()
+
+    # psi.differentiate(lon) == np.gradient(psi)/np.gradient(lon) [psi/lon]
+    dpsi_dlon = psi.differentiate(lon,edge_order=2).reduce(np.nan_to_num)
+    dpsi_dlat = psi.differentiate(lat,edge_order=2).reduce(np.nan_to_num)
+    d2psi_dlon2 = dpsi_dlon.differentiate(lon,edge_order=2)
+    d2psi_dlat2 = dpsi_dlat.differentiate(lat,edge_order=2)
+    d2psi_dlon_dlat = dpsi_dlon.differentiate(lat,edge_order=2)
+
+    wx =  uref*one_over_coslat2*one_over_a2*(dpsi_dlon**2 - psi*d2psi_dlon2) \
+        + vref*one_over_a2/coslat*(dpsi_dlon*dpsi_dlat - psi*d2psi_dlon_dlat)
+    wy =  uref*one_over_a2/coslat*(dpsi_dlon*dpsi_dlat - psi*d2psi_dlon_dlat) \
+        + vref*one_over_a2*(dpsi_dlat**2 - psi*d2psi_dlat2)
+
+    coeff = coslat/2/mag_u
+
+    rad2deg = 180/np.pi
+
+    # get the vectors in physical units of m2/s2, correcting for radians vs. degrees
+    wx = coeff*wx*rad2deg*rad2deg
+    wy = coeff*wy*rad2deg*rad2deg
+
+    wx.name = 'wx'
+    wx.attrs['units'] = 'm2/s2'
+    wy.name = 'wy'
+    wy.attrs['units'] = 'm2/s2'
+
+    if tref is None:
+        return wx,wy
+    else:
+        # psi.differentiate(pres) == np.gradient(psi)/np.gradient(pres) [psi/pres]
+        dpsi_dpres = psi.differentiate(pres,edge_order=2).reduce(np.nan_to_num)
+        d2psi_dlon_dpres = dpsi_dlon.differentiate(pres,edge_order=2)
+        d2psi_dlat_dpres = dpsi_dlat.differentiate(pres,edge_order=2)
+        # S2 = -\alpha*\partial_p\ln\theta, \alpha = 1/\rho = Rd*T/p
+        #    = R/p*(p/p0)**\kappa d\theta/dp, Vallis (2017, p. 192 (eq. 5.127))
+        #  this should be a reference profile and a function of pressure only!
+        pressure = uref[pres]
+        if isinstance(tref,Dataset) or isinstance(tref,DataArray):
+            pp0 = (p0/pressure)**kappa
+            theta = pp0*tref
+            S2 = -Rd/pressure*(pressure/p0)**kappa*theta.differentiate(pres,edge_order=2)
+            # S2 = ExtractArray(S2)
+            # S2 = S2.where(S2>1e-7,1e-7) # avoid division by zero
+        else:
+            S2 = tref
+
+        wz = f**2/S2*( uref/a0/coslat*(dpsi_dlon*dpsi_dpres - psi*d2psi_dlon_dpres) + vref/a0*(dpsi_dlat*dpsi_dpres - psi*d2psi_dlat_dpres) )
+
+        wz = coeff*wz*rad2deg
+        # wz = ExtractArray(wz)
+        wz.name = 'wz'
+        wz.attrs['units'] = 'hPa.m/s2'
+
+        return wx,wy,wz
+
+##############################################################################################
+def PlotEPfluxArrows(x,y,ep1,ep2,fig,ax,xlim=None,ylim=None,xscale='linear',yscale='linear',invert_y=True, newax=False, pivot='tail',scale=None):
+	"""Correctly scales the Eliassen-Palm flux vectors for plotting on a latitude-pressure or latitude-height axis.
+		x,y,ep1,ep2 assumed to be xarray.DataArrays.
+
+	INPUTS:
+		x       : horizontal coordinate, assumed in degrees (latitude) [degrees]
+		y       : vertical coordinate, any units, but usually this is pressure or height
+		ep1     : horizontal Eliassen-Palm flux component, in [m2/s2]. Typically, this is ep1_cart from
+		           ComputeEPfluxDiv()
+		ep2     : vertical Eliassen-Palm flux component, in [U.m/s2], where U is the unit of y.
+			       Typically, this is ep2_cart from ComputeEPfluxDiv(), in [hPa.m/s2] and y is pressure [hPa].
+		fig     : a matplotlib figure object. This figure contains the axes ax.
+		ax      : a matplotlib axes object. This is where the arrows will be plotted onto.
+		xlim    : axes limits in x-direction. If None, use [min(x),max(x)]. [None]
+		ylim    : axes limits in y-direction. If None, use [min(y),max(y)]. [None]
+		xscale  : x-axis scaling. currently only 'linear' is supported. ['linear']
+		yscale  : y-axis scaling. 'linear' or 'log' ['linear']
+		invert_y: invert y-axis (for pressure coordinates). [True]
+		newax   : plot on second y-axis. [False]
+		pivot   : keyword argument for quiver() ['tail']
+		scale   : keyword argument for quiver() [None]
+
+	OUTPUTS:
+	   Fphi*dx : x-component of properly scaled arrows. Units of [m3.inches]
+	   Fp*dy   : y-component of properly scaled arrows. Units of [m3.inches]
+	   ax   : secondary y-axis if newax == True
+	"""
+	import numpy as np
+	import matplotlib.pyplot as plt
+	#
+	def Deltas(z,zlim):
+		# if zlim is None:
+		return np.max(z)-np.min(z)
+		# else:
+			# return zlim[1]-zlim[0]
+	# Scale EP vector components as in Edmon, Hoskins & McIntyre JAS 1980:
+	cosphi = np.cos(np.deg2rad(x))
+	a0 = 6376000.0 # Earth radius [m]
+	grav = 9.81
+	# first scaling: Edmon et al (1980), Eqs. 3.1 & 3.13
+	Fphi = 2*np.pi/grav*cosphi**2*a0**2*ep1 # [m3.rad]
+	Fp   = 2*np.pi/grav*cosphi**2*a0**3*ep2 # [m3.hPa]
+	#
+	# Now comes what Edmon et al call "distances occupied by 1 radian of
+	#  latitude and 1 [hecto]pascal of pressure on the diagram."
+	# These distances depend on figure aspect ratio and axis scale
+	#
+	# first, get the axis width and height for
+	#  correct aspect ratio
+	width,height = GetAxSize(fig,ax)
+	# we use min(),max(), but note that if the actual axis limits
+	#  are different, this will be slightly wrong.
+	delta_x = Deltas(x,xlim)
+	delta_y = Deltas(y,ylim)
+	#
+	#scale the x-axis:
+	if xscale == 'linear':
+		dx = width/delta_x/np.pi*180
+	else:
+		raise ValueError('ONLY LINEAR X-AXIS IS SUPPORTED AT THE MOMENT')
+	#scale the y-axis:
+	if invert_y:
+		y_sign = -1
+	else:
+		y_sign = 1
+	if yscale == 'linear':
+		dy = y_sign*height/delta_y
+	elif yscale == 'log':
+		dy = y_sign*height/y/np.log(np.max(y)/np.min(y))
+	#
+	# plot the arrows onto axis
+	quivArgs = {'angles':'uv','scale_units':'inches','pivot':pivot}
+	if scale is not None:
+		quivArgs['scale'] = scale
+	if newax:
+		ax = ax.twinx()
+		ax.set_ylabel('pressure [hPa]')
+	try:
+		ax.quiver(x,y,Fphi*dx,Fp*dy,**quivArgs)
+	except:
+		ax.quiver(x,y,dx*Fphi.transpose(),dy*Fp.transpose(),**quivArgs)
+	if invert_y:
+		ax.invert_yaxis()
+	if xlim is not None:
+		ax.set_xlim(xlim)
+	if ylim is not None:
+		ax.set_ylim(ylim)
+	ax.set_yscale(yscale)
+	ax.set_xscale(xscale)
+	#
+	if newax:
+		return Fphi*dx,Fp*dy,ax
+	else:
+		return Fphi*dx,Fp*dy
 
 ##############################################################################################
 def GlobalAvg(lat,data,axis=-1,lim=20,mx=90,cosp=1):
@@ -978,6 +1197,8 @@ def ComputeRefractiveIndex(lat,pres,uz,Tz,k,N2const=None):
 		Refractive index as in Simpson et al (2009) doi 10.1175/2008JAS2758.1 and also Matsuno (1970) doi 10.1175/1520-0469(1970)027<0871:VPOSPW>2.0.CO;2
 		Stationary waves are assumed, ie c=0.
 
+		Setting k=0 means the only term depending on wave number is left out. This could be more efficient if n2(k) for different values of k is of interest.
+
 		meridonal PV gradient is
 		q_\phi = A - B + C, where
 				A = 2*Omega*cos\phi
@@ -994,7 +1215,7 @@ def ComputeRefractiveIndex(lat,pres,uz,Tz,k,N2const=None):
 			pres  - pressure [hPa]
 			uz    - zonal mean zonal wind, dimension pres x lat [m/s]
 			Tz    - zonal mean temperature, dimension pres x lat [K]
-			k     - zonal wave number [.]
+			k     - zonal wave number. [.]
 			N2const - if not None, assume N2 = const = N2const [1/s2]
 		Outputs are:
 			n2  - refractive index, dimension pres x lat [.]
@@ -1296,82 +1517,73 @@ def Convert2Days(time,units,calendar):
 	return t.date2num(date)
 
 #######################################################
-def SwapDomain(data,swap_ax=-1,is_dim=False,lower_bound=None):
-	"""
-		Swap first and second halves of a domain along a given axis.
-		Typically, this is uesed to convert a grid back and forth
-		from -180 to 180 into 0 to 360 in longitude.
-
-		INPUTS:
-			data:        array to regrid
-			swap_ax:     axis of along which to swap
-			is_dim:      data is the coordinate along which to swap.
-						  In that case, the values have to be changed.
-			lower_bound: if is_dim=True, where should the dimension start?
-						  if None (default), will start from midpoint
-		OUTPUTS:
-			new_data: new array on newly arranged grid
-	"""
-	if is_dim and len(data.shape) > 1:
-		raise ValueError('INPUT DATA CANNOT BE DIMENSION (NUM(DIMS)!=1)')
-	swap_len = data.shape[swap_ax]
-	new_lons = np.concatenate([np.arange(swap_len//2)+swap_len//2,np.arange(swap_len//2)])
-	if len(data.shape) > 1:
-		data_roll = AxRoll(data,swap_ax)
-		new_data  = data_roll[new_lons,:]
-		return AxRoll(new_data,swap_ax,invert=True)
-	else:
-		new_data = data[new_lons]
-		if is_dim:
-			if lower_bound is None:
-				lower_bound = new_data[0]
-			dl = np.diff(data)
-			return np.concatenate([[lower_bound],lower_bound+np.cumsum(dl)])
-		else:
-			return new_data
-		return new_data
-
-#######################################################
-def InvertCoordinate(data,axis=-1):
-	"""
-		Invert the direction of a coordinate.
-
-		INPUTS:
-			data:  array to regrid
-			axis:  axis of coordinate to be inverted
-		OUTPUTS:
-			output: new array on newly arranged coordinate
-	"""
-	if len(data.shape) > 1:
-		data_roll = AxRoll(data,axis)
-		return AxRoll(data_roll[-1::-1,:],axis,invert=True)
-	else:
-		return data[-1::-1]
-#######################################################
 def ERA2Model(data,lon_name='longitude',lat_name='latitude'):
 	"""
 		Invert the direction of latitude, and swap longitude domain
 		 from -180,180 to 0,360.
-		 Assumes an xr.DataArray.
+		 Assumes an xr.DataArray or xr.Dataset.
 
 		INPUTS:
-			data:     xarray.DataArray to regrid
-			lon_name: name of longitude dimension
-			lat_name: name of latitude dimension
+			data:      xarray.DataArray or xarray.Dataset to regrid
+			lon_name:  name of longitude dimension. Set to None if nothing should be done.
+			lat_name:  name of latitude dimension. Set to None if nothing should be done.
 		OUTPUTS:
 			data:     xarray.DataArray with latitude swapped and
 					   longitude from 0 to 360 degrees.
 	"""
-	lon_ax = data.get_axis_num(lon_name)
-	lat_ax = data.get_axis_num(lat_name)
-	# invert the data array
-	dataswap = SwapDomain(data.values,lon_ax)
-	dataswap = InvertCoordinate(dataswap,lat_ax)
-	# we also want to invert the dimensions
-	lonswap = SwapDomain(data[lon_name].values,is_dim=True)
-	latswap = data[lat_name].values[::-1]
-	# now change the values in the xr.DataArray
-	data.values = dataswap
-	data[lon_name].values = lonswap
-	data[lat_name].values = latswap
-	return data
+	if lat_name is not None:
+		data = data.interp({lat_name:data[lat_name][::-1]},method='nearest')
+	if lon_name is not None:
+		data_low = data.sel({lon_name: slice(0,180)})
+		data_neg = data.sel({lon_name: slice(-180,-0.001)})
+		data_neg[lon_name] += 360
+	return data.sortby(lon_name)
+
+#######################################################
+def ComputeGeostrophicWind(Z,lon_name='longitude',lat_name='latitude',qg_limit=5.0):
+	"""
+		Compute u,v from geostrophic balance
+		Z is geopotential height
+	"""
+	import numpy as np
+	a0 = 6376.0e3
+	Omega = 7.292e-5
+	grav = 9.81
+	# f = 0 at the equator, which will obviously be a problem
+	#  so we make f=infty there so that u,v = 0 between -qg_limit and +qg_limit
+	f = 2*Omega*np.sin(np.deg2rad(Z[lat_name])).where(np.abs(Z[lat_name])>qg_limit,np.infty)
+	cosPhi = np.cos(np.deg2rad(Z[lat_name]))
+	u = -grav*Z.differentiate(lat_name)/f/a0
+	v =  grav*Z.differentiate(lon_name)/f/a0/cosPhi
+	return u,v
+
+#######################################################
+def Projection(projection='EqualEarth',transform='PlateCarree',coast=False,kw_args=None):
+	"""
+		Create a new figure with a given projection. To plot data, invoke:
+			fig,ax,kw = Projection()
+			ax.contourf(x,y,z,**kw)
+
+		INPUTS:
+			projection:  desired map projection for plotting.
+			transform:   map projection of the data.
+			coast:       whether or not to draw coastlines (can be done later with ax.coastines())
+			kw_args:     keyword arguments (dict()) for projection.
+
+		OUTPUTS:
+			fig:         figure object
+			ax:          axis with map projection
+			transf:      transform in form of dictionary.
+	"""
+	from cartopy import crs as ccrs
+	cproj = getattr(ccrs,projection)
+	if kw_args is None:
+		proj = cproj()
+	else:
+		proj = cproj(**kw_args)
+	from matplotlib import pyplot as plt
+	fig = plt.figure()
+	ax  = plt.axes(projection=proj)
+	if coast:
+		ax.coastlines()
+	return fig,ax,{'transform':getattr(ccrs,transform)()}
